@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Generated simulation output
+simulasyon_ciktilari.csv
+doz_bagimli_aec_egrileri.png
+ciktilar/
+ciktilar_gui_test/
