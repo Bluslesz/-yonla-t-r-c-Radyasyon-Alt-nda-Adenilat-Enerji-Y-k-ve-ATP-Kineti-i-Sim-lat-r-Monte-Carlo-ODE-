@@ -9,11 +9,13 @@ import tkinter as tk
 from tkinter import ttk
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from scipy.integrate import solve_ivp
@@ -280,7 +282,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-cells", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--uncertainty-replicates", type=int, default=5)
-    parser.add_argument("--output-dir", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "ciktilar",
+    )
     parser.add_argument("--no-show", action="store_true", help="Grafigi ekranda acma")
     parser.add_argument("--headless", action="store_true", help="Grafik arayuzu acmadan calistir")
     return parser
@@ -303,93 +309,443 @@ def validate_cli_args(args: argparse.Namespace) -> np.ndarray:
     return np.linspace(args.dose_min, args.dose_max, args.dose_points)
 
 
+def build_results_dataframe(
+    doses: np.ndarray,
+    acute: np.ndarray,
+    acute_sd: np.ndarray,
+    adaptive: np.ndarray,
+    adaptive_sd: np.ndarray,
+    atp: np.ndarray,
+    adp: np.ndarray,
+    amp: np.ndarray,
+    priming_dose: float,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Doz_Gy": doses,
+            "AEC_Akut": np.round(acute, 4),
+            "AEC_Akut_SD": np.round(acute_sd, 4),
+            f"AEC_Adaptif_D1_{priming_dose:g}Gy": np.round(adaptive, 4),
+            f"AEC_Adaptif_D1_{priming_dose:g}Gy_SD": np.round(adaptive_sd, 4),
+            "ATP_Mol_Kesri": np.round(atp, 4),
+            "ADP_Mol_Kesri": np.round(adp, 4),
+            "AMP_Mol_Kesri": np.round(amp, 4),
+        }
+    )
+
+
+def save_results(results: pd.DataFrame, output_dir: Path) -> tuple[Path, Path]:
+    csv_path = output_dir / "simulasyon_ciktilari.csv"
+    excel_path = output_dir / "simulasyon_ciktilari.xlsx"
+    results.to_csv(csv_path, index=False)
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        sheet_name = "AEC Sonuçları"
+        results.to_excel(writer, sheet_name=sheet_name, index=False)
+        worksheet = writer.sheets[sheet_name]
+        worksheet.freeze_panes = "A2"
+        worksheet.sheet_view.showGridLines = False
+
+        header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for column_index, column_name in enumerate(results.columns, start=1):
+            values = results[column_name].tolist()
+            display_values = [str(column_name)] + [str(value) for value in values]
+            worksheet.column_dimensions[
+                worksheet.cell(row=1, column=column_index).column_letter
+            ].width = min(max(max(map(len, display_values)) + 2, 12), 34)
+
+            number_format = "0.000" if column_name == "Doz_Gy" else "0.0000"
+            for row_index in range(2, len(values) + 2):
+                cell = worksheet.cell(row=row_index, column=column_index)
+                cell.number_format = number_format
+                cell.alignment = Alignment(horizontal="center")
+
+        if not results.empty:
+            table = Table(
+                displayName="AECResults",
+                ref=f"A1:{worksheet.cell(row=len(results) + 1, column=len(results.columns)).coordinate}",
+            )
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            worksheet.add_table(table)
+
+    return csv_path, excel_path
+
+
+def style_plot_axis(axis: Any, detailed: bool = False) -> None:
+    axis.set_facecolor("#FFFFFF")
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", color="#DCE3EA", linewidth=0.8)
+    axis.grid(axis="x", visible=False)
+    axis.tick_params(colors="#52606D", labelsize=10 if detailed else 8)
+    for spine in ("top", "right"):
+        axis.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        axis.spines[spine].set_color("#C7D0D9")
+        axis.spines[spine].set_linewidth(0.8)
+    axis.title.set_color("#243447")
+    axis.title.set_fontweight("bold")
+    axis.title.set_fontsize(12 if detailed else 10)
+    axis.xaxis.label.set_color("#52606D")
+    axis.yaxis.label.set_color("#52606D")
+    axis.xaxis.label.set_fontsize(10 if detailed else 8)
+    axis.yaxis.label.set_fontsize(10 if detailed else 8)
+
+
+def annotate_threshold(axis: Any, value: float, color: str, fontsize: int = 7) -> None:
+    axis.annotate(
+        f"{value:.2f}",
+        (1.0, value),
+        xycoords=("axes fraction", "data"),
+        xytext=(-4, 3),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        color=color,
+        fontsize=fontsize,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 1},
+    )
+
+
+def plot_dose_response(
+    axis: Any,
+    doses: np.ndarray,
+    aec_acute: np.ndarray,
+    sd_acute: np.ndarray,
+    aec_adaptive: np.ndarray,
+    sd_adaptive: np.ndarray,
+    priming_dose: float,
+    detailed: bool = False,
+) -> None:
+    navy = "#245B84"
+    teal = "#168C83"
+    amber = "#D9822B"
+    red = "#C45151"
+    green = "#4E8B62"
+    axis.plot(
+        doses,
+        aec_acute,
+        color=navy,
+        lw=2.2,
+        marker="o",
+        ms=5 if detailed else 4,
+        markeredgecolor="white",
+        markeredgewidth=0.7,
+        label="Akut doz",
+    )
+    axis.fill_between(
+        doses,
+        np.clip(aec_acute - sd_acute, 0.0, 1.0),
+        np.clip(aec_acute + sd_acute, 0.0, 1.0),
+        color=navy,
+        alpha=0.14,
+        label="Akut ±1 SS",
+    )
+    axis.fill_between(
+        doses,
+        np.clip(aec_adaptive - sd_adaptive, 0.0, 1.0),
+        np.clip(aec_adaptive + sd_adaptive, 0.0, 1.0),
+        color=teal,
+        alpha=0.12,
+        label="Adaptif ±1 SS",
+    )
+    axis.plot(
+        doses,
+        aec_adaptive,
+        color=teal,
+        lw=2.0,
+        ls="--",
+        marker="s",
+        ms=4.5 if detailed else 3.5,
+        markeredgecolor="white",
+        markeredgewidth=0.7,
+        label=f"Ön uyarım ({priming_dose:g} Gy)",
+    )
+    axis.axhspan(
+        0.75,
+        0.95,
+        color=green,
+        alpha=0.09,
+        zorder=0,
+        label="Fizyolojik referans (0.75–0.95)",
+    )
+    axis.axhline(0.70, color=amber, ls=":", lw=1.5, label="Referans eşik 0.70")
+    axis.axhline(0.50, color=red, ls="-.", lw=1.4, label="Referans eşik 0.50")
+    annotate_threshold(axis, 0.70, amber, 9 if detailed else 7)
+    annotate_threshold(axis, 0.50, red, 9 if detailed else 7)
+    axis.set(
+        title="AEC doz yanıtı",
+        xlabel="Radyasyon dozu (Gy)",
+        ylabel="Adenilat enerji yükü (AEC)",
+        ylim=(0.0, 1.02),
+    )
+    if detailed:
+        axis.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=9,
+            frameon=False,
+        )
+    else:
+        axis.legend(loc="upper right", fontsize=6.5, frameon=False, ncol=2)
+
+
+def calculate_aec_time_courses(
+    n_cells: int,
+    seed: int,
+) -> tuple[np.ndarray, list[tuple[str, str, np.ndarray]]]:
+    time_points = np.linspace(0.0, PARAMETERS.simulation_end, 600)
+    dose_cases = [
+        (0.0, "#245B84", "0.0 Gy · kontrol"),
+        (1.2, "#D9822B", "1.2 Gy · orta doz"),
+        (3.0, "#C45151", "3.0 Gy · yüksek doz"),
+    ]
+    time_courses: list[tuple[str, str, np.ndarray]] = []
+    for dose, color, label in dose_cases:
+        stress_mean, _, _ = monte_carlo_damage_fraction(
+            dose, n_cells=n_cells, seed=seed
+        )
+        solution = solve_adenylate_kinetics(stress_mean, time_points)
+        atp = np.maximum(solution.y[0], 0.0)
+        adp = np.maximum(solution.y[1], 0.0)
+        amp = np.maximum(solution.y[2], 0.0)
+        total = np.maximum(atp + adp + amp, np.finfo(float).tiny)
+        aec_time = (atp + 0.5 * adp) / total
+        time_courses.append((color, label, aec_time))
+    return time_points, time_courses
+
+
+def plot_aec_time_courses(
+    axis: Any,
+    time_points: np.ndarray,
+    time_courses: Sequence[tuple[str, str, np.ndarray]],
+    detailed: bool = False,
+) -> None:
+    amber = "#D9822B"
+    red = "#C45151"
+    for color, label, aec_time in time_courses:
+        axis.plot(time_points, aec_time, color=color, lw=2.4 if detailed else 2.0)
+        axis.annotate(
+            label,
+            (time_points[-1], aec_time[-1]),
+            xytext=(8, 0),
+            textcoords="offset points",
+            va="center",
+            color=color,
+            fontsize=9 if detailed else 7,
+            clip_on=False,
+        )
+
+    axis.axhline(0.70, color=amber, ls=":", lw=1.5)
+    axis.axhline(0.50, color=red, ls="-.", lw=1.4)
+    annotate_threshold(axis, 0.70, amber, 9 if detailed else 7)
+    annotate_threshold(axis, 0.50, red, 9 if detailed else 7)
+    axis.set(
+        title="AEC'nin zamana bağlı değişimi",
+        xlabel="Zaman (s)",
+        ylabel="Anlık AEC",
+        ylim=(0.0, 1.02),
+        xlim=(time_points[0], time_points[-1] * 1.18),
+    )
+
+
+def plot_adenylate_fractions(
+    axis: Any,
+    doses: np.ndarray,
+    atp_fraction: np.ndarray,
+    adp_fraction: np.ndarray,
+    amp_fraction: np.ndarray,
+    detailed: bool = False,
+) -> None:
+    axis.plot(doses, atp_fraction, color="#245B84", lw=2.2, label="ATP")
+    axis.plot(doses, adp_fraction, color="#D9822B", lw=2.0, ls="--", label="ADP")
+    axis.plot(doses, amp_fraction, color="#8256A5", lw=2.0, ls="-.", label="AMP")
+    axis.set(
+        title="Adenilat havuzlarının dağılımı",
+        xlabel="Radyasyon dozu (Gy)",
+        ylabel="Mol kesri",
+        ylim=(0.0, 1.0),
+    )
+    if detailed:
+        axis.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=9,
+            frameon=False,
+        )
+    else:
+        axis.legend(loc="best", fontsize=9, frameon=False)
+
+
+def plot_simulation_results(
+    figure: Figure,
+    axes: Sequence[Any],
+    doses: np.ndarray,
+    aec_acute: np.ndarray,
+    sd_acute: np.ndarray,
+    aec_adaptive: np.ndarray,
+    sd_adaptive: np.ndarray,
+    atp_fraction: np.ndarray,
+    adp_fraction: np.ndarray,
+    amp_fraction: np.ndarray,
+    time_points: np.ndarray,
+    time_courses: Sequence[tuple[str, str, np.ndarray]],
+    priming_dose: float,
+) -> None:
+    figure.set_facecolor("#FFFFFF")
+    figure.suptitle(
+        "Doza Bağlı AEC ve Adenilat Dinamikleri",
+        fontsize=15,
+        fontweight="bold",
+        color="#243447",
+    )
+    plot_dose_response(
+        axes[0], doses, aec_acute, sd_acute, aec_adaptive, sd_adaptive, priming_dose
+    )
+    plot_aec_time_courses(axes[1], time_points, time_courses)
+    plot_adenylate_fractions(axes[2], doses, atp_fraction, adp_fraction, amp_fraction)
+    for axis in axes:
+        style_plot_axis(axis)
+    figure.subplots_adjust(left=0.07, right=0.99, top=0.84, bottom=0.14, wspace=0.34)
+
+
+def save_detailed_plots(
+    output_dir: Path,
+    doses: np.ndarray,
+    aec_acute: np.ndarray,
+    sd_acute: np.ndarray,
+    aec_adaptive: np.ndarray,
+    sd_adaptive: np.ndarray,
+    atp_fraction: np.ndarray,
+    adp_fraction: np.ndarray,
+    amp_fraction: np.ndarray,
+    time_points: np.ndarray,
+    time_courses: Sequence[tuple[str, str, np.ndarray]],
+    priming_dose: float,
+) -> None:
+    detailed_plots: list[tuple[str, str, str, Callable[[Any], None]]] = [
+        (
+            "aec_doz_yaniti.png",
+            "A | Doza bağlı adenilat enerji yükü",
+            "AEC, ATP ağırlıklı enerji durumunu 0–1 arasında özetler. "
+            "Gölgeli alanlar tekrarlar arası ±1 standart sapmayı; yatay çizgiler "
+            "modelde kullanılan referans eşikleri gösterir. Düşük AEC değerleri "
+            "grafikte kırpılmadan gösterilir.",
+            lambda axis: plot_dose_response(
+                axis,
+                doses,
+                aec_acute,
+                sd_acute,
+                aec_adaptive,
+                sd_adaptive,
+                priming_dose,
+                detailed=True,
+            ),
+        ),
+        (
+            "aec_zaman_kinetigi.png",
+            "B | Zamana bağlı AEC kinetiği",
+            "Eğriler kontrol, orta ve yüksek doz için adenilat ODE modelinden "
+            "hesaplanmıştır. Yatay eksen simülasyon süresini, düşey eksen anlık "
+            "AEC'yi gösterir. 0.70 ve 0.50 çizgileri model referans eşikleridir.",
+            lambda axis: plot_aec_time_courses(
+                axis, time_points, time_courses, detailed=True
+            ),
+        ),
+        (
+            "adenilat_mol_kesirleri.png",
+            "C | Doza bağlı ATP, ADP ve AMP dağılımı",
+            "Mol kesirleri her dozda toplam adenilat havuzuna göre normalize edilir; "
+            "bu nedenle ATP, ADP ve AMP kesirlerinin toplamı yaklaşık 1'dir.",
+            lambda axis: plot_adenylate_fractions(
+                axis,
+                doses,
+                atp_fraction,
+                adp_fraction,
+                amp_fraction,
+                detailed=True,
+            ),
+        ),
+    ]
+
+    for filename, title, explanation, draw_plot in detailed_plots:
+        figure, axis = plt.subplots(figsize=(11, 6.4), dpi=300)
+        figure.set_facecolor("#FFFFFF")
+        draw_plot(axis)
+        style_plot_axis(axis, detailed=True)
+        figure.suptitle(title, fontsize=15, fontweight="bold", color="#243447")
+        figure.text(
+            0.10,
+            0.035,
+            explanation,
+            ha="left",
+            va="bottom",
+            fontsize=9,
+            color="#52606D",
+            wrap=True,
+        )
+        figure.subplots_adjust(left=0.11, right=0.76, top=0.86, bottom=0.25)
+        figure.savefig(output_dir / filename, dpi=300, bbox_inches="tight")
+        plt.close(figure)
+
+
 def create_plots(
     doses: np.ndarray,
     aec_acute: np.ndarray,
     sd_acute: np.ndarray,
     aec_adaptive: np.ndarray,
+    sd_adaptive: np.ndarray,
     atp_fraction: np.ndarray,
     adp_fraction: np.ndarray,
     amp_fraction: np.ndarray,
     output_dir: Path,
     n_cells: int,
     seed: int,
+    priming_dose: float,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=300)
-
-    ax = axes[0]
-    ax.plot(doses, aec_acute, "o-", color="#1f4e78", lw=2.2, ms=4,
-            label="Tekil Akut Doz ($D$)")
-    ax.fill_between(
+    time_points, time_courses = calculate_aec_time_courses(n_cells, seed)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.8), dpi=300)
+    plot_simulation_results(
+        fig,
+        axes,
         doses,
-        np.clip(aec_acute - sd_acute, 0.0, 1.0),
-        np.clip(aec_acute + sd_acute, 0.0, 1.0),
-        color="#1f4e78",
-        alpha=0.18,
-        label="$\\pm$ 1 Monte Carlo guven araligi",
+        aec_acute,
+        sd_acute,
+        aec_adaptive,
+        sd_adaptive,
+        atp_fraction,
+        adp_fraction,
+        amp_fraction,
+        time_points,
+        time_courses,
+        priming_dose,
     )
-    ax.plot(doses, aec_adaptive, "s--", color="#2e7d32", lw=2.0, ms=4,
-            label="On Uyarim + $D_2$")
-    ax.axhspan(0.75, 0.95, color="#a5d6a7", alpha=0.25,
-               label="Fizyolojik aralik (0.75-0.95)")
-    ax.axhline(0.70, color="#ef6c00", ls=":", lw=1.6,
-               label="AMPK aktivasyon eşiği (0.70)")
-    ax.axhline(0.50, color="#c62828", ls="-.", lw=1.6,
-               label="Apoptoz/Nekroz eşiği (0.50)")
-    ax.set(
-        title="A) Doz-Bagimli Adenilat Enerji Yukune (AEC)",
-        xlabel="Iyonlastirici radyasyon dozu, $D$ (Gy)",
-        ylabel="AEC",
-        ylim=(0.25, 1.02),
-    )
-    ax.grid(True, ls="--", alpha=0.4)
-    ax.legend(loc="lower left", fontsize=7.8, framealpha=0.9)
-
-    ax2 = axes[1]
-    dose_cases = [
-        (0.0, "#1f4e78", "0.0 Gy (Kontrol)"),
-        (1.2, "#ef6c00", "1.2 Gy (AMPK Stresi)"),
-        (3.0, "#c62828", "3.0 Gy (Enerji Cokusu)"),
-    ]
-    t_eval = np.linspace(0.0, PARAMETERS.simulation_end, 600)
-    for dose_case, color, label in dose_cases:
-        stress_mean, _, _ = monte_carlo_damage_fraction(
-            dose_case, n_cells=n_cells, seed=seed
-        )
-        solution = solve_adenylate_kinetics(stress_mean, t_eval)
-        atp = np.maximum(solution.y[0], 0.0)
-        adp = np.maximum(solution.y[1], 0.0)
-        amp = np.maximum(solution.y[2], 0.0)
-        aec_time = (atp + 0.5 * adp) / (atp + adp + amp)
-        ax2.plot(t_eval, aec_time, color=color, lw=2.0, label=label)
-
-    ax2.axhline(0.70, color="#ef6c00", ls=":", lw=1.2)
-    ax2.axhline(0.50, color="#c62828", ls="-.", lw=1.2)
-    ax2.set(
-        title="B) Zamana Bagli AEC Kinetik Evrimi",
-        xlabel="Zaman, $t$ (saniye)",
-        ylabel="Anlik AEC(t)",
-        ylim=(0.25, 1.02),
-    )
-    ax2.grid(True, ls="--", alpha=0.4)
-    ax2.legend(loc="lower left", fontsize=8.5)
-
-    ax3 = axes[2]
-    ax3.plot(doses, atp_fraction, "-", color="#1565c0", lw=2.2, label="ATP Mol Kesri")
-    ax3.plot(doses, adp_fraction, "--", color="#f9a825", lw=2.2, label="ADP Mol Kesri")
-    ax3.plot(doses, amp_fraction, "-.", color="#ad1457", lw=2.2, label="AMP Mol Kesri")
-    ax3.set(
-        title="C) Doza Bagli Adenilat Dagilimi",
-        xlabel="Iyonlastirici radyasyon dozu (Gy)",
-        ylabel="Mol Kesri ([X] / Toplam Adenilat)",
-        ylim=(0.0, 1.0),
-    )
-    ax3.grid(True, ls="--", alpha=0.4)
-    ax3.legend(loc="center right", fontsize=8.5)
-
-    fig.tight_layout()
     fig.savefig(output_dir / "doz_bagimli_aec_egrileri.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
+    save_detailed_plots(
+        output_dir,
+        doses,
+        aec_acute,
+        sd_acute,
+        aec_adaptive,
+        sd_adaptive,
+        atp_fraction,
+        adp_fraction,
+        amp_fraction,
+        time_points,
+        time_courses,
+        priming_dose,
+    )
 
 
 class SimulationGui:
@@ -446,7 +802,12 @@ class SimulationGui:
         status_frame = ttk.LabelFrame(right, text="Durum")
         status_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.status_var = tk.StringVar(value="Hazir")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(anchor="w", padx=8, pady=4)
+        ttk.Label(
+            status_frame,
+            textvariable=self.status_var,
+            wraplength=350,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=4)
         self.progress = ttk.Progressbar(status_frame, maximum=100)
         self.progress.pack(fill=tk.X, padx=8, pady=(0, 8))
 
@@ -525,12 +886,8 @@ class SimulationGui:
             import time
             started = time.perf_counter()
             try:
-                output_dir = Path(self.default_args.output_dir)
-                try:
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                except (OSError, UnicodeError):
-                    output_dir = Path(r"C:\AEC_CIKTILAR")
-                    output_dir.mkdir(parents=True, exist_ok=True)
+                output_dir = Path(self.default_args.output_dir).expanduser().resolve()
+                output_dir.mkdir(parents=True, exist_ok=True)
                 acute, acute_sd, atp, adp, amp = simulate_dose_response(
                     doses,
                     priming_dose=0.0,
@@ -549,18 +906,18 @@ class SimulationGui:
                         i, d, r, offset=len(doses) * replicates
                     ),
                 )
-                results = pd.DataFrame({
-                    "Doz_Gy": doses,
-                    "AEC_Akut": np.round(acute, 4),
-                    "AEC_Akut_SD": np.round(acute_sd, 4),
-                    f"AEC_Adaptif_D1_{priming_dose:g}Gy": np.round(adaptive, 4),
-                    f"AEC_Adaptif_D1_{priming_dose:g}Gy_SD": np.round(adaptive_sd, 4),
-                    "ATP_Mol_Kesri": np.round(atp, 4),
-                    "ADP_Mol_Kesri": np.round(adp, 4),
-                    "AMP_Mol_Kesri": np.round(amp, 4),
-                })
-                csv_path = output_dir / "simulasyon_ciktilari.csv"
-                results.to_csv(csv_path, index=False)
+                results = build_results_dataframe(
+                    doses,
+                    acute,
+                    acute_sd,
+                    adaptive,
+                    adaptive_sd,
+                    atp,
+                    adp,
+                    amp,
+                    priming_dose,
+                )
+                csv_path, excel_path = save_results(results, output_dir)
                 elapsed = time.perf_counter() - started
                 self.event_queue.put(
                     (
@@ -570,13 +927,16 @@ class SimulationGui:
                             "acute": acute,
                             "sd": acute_sd,
                             "adaptive": adaptive,
+                            "adaptive_sd": adaptive_sd,
                             "atp": atp,
                             "adp": adp,
                             "amp": amp,
                             "elapsed": elapsed,
                             "csv": csv_path,
+                            "excel": excel_path,
                             "n_cells": n_cells,
                             "seed": seed,
+                            "priming_dose": priming_dose,
                             "output_dir": output_dir,
                         },
                     )
@@ -609,6 +969,7 @@ class SimulationGui:
         acute = payload["acute"]
         sd = payload["sd"]
         adaptive = payload["adaptive"]
+        adaptive_sd = payload["adaptive_sd"]
         atp = payload["atp"]
         adp = payload["adp"]
         amp = payload["amp"]
@@ -630,56 +991,24 @@ class SimulationGui:
 
         for axis in self.axes:
             axis.clear()
-
-        ax = self.axes[0]
-        ax.plot(doses, acute, "o-", color="#1f4e78", lw=2.0, ms=4,
-                label="Tekil akut doz")
-        ax.fill_between(
-            doses,
-            np.clip(acute - sd, 0.0, 1.0),
-            np.clip(acute + sd, 0.0, 1.0),
-            color="#1f4e78",
-            alpha=0.18,
+        time_points, time_courses = calculate_aec_time_courses(
+            payload["n_cells"], payload["seed"]
         )
-        ax.plot(doses, adaptive, "s--", color="#2e7d32", lw=2.0, ms=4,
-                label="Adaptif yanit")
-        ax.axhspan(0.75, 0.95, color="#a5d6a7", alpha=0.25)
-        ax.axhline(0.70, color="#ef6c00", ls=":", lw=1.4)
-        ax.axhline(0.50, color="#c62828", ls="-.", lw=1.4)
-        ax.set(title="A) Doz-Bagimli AEC", xlabel="Doz (Gy)", ylabel="AEC", ylim=(0.25, 1.02))
-        ax.grid(True, ls="--", alpha=0.4)
-        ax.legend(loc="lower left", fontsize=8)
-
-        ax2 = self.axes[1]
-        t_eval = np.linspace(0.0, PARAMETERS.simulation_end, 600)
-        cases = [(0.0, "#1f4e78", "0.0 Gy"), (1.2, "#ef6c00", "1.2 Gy"), (3.0, "#c62828", "3.0 Gy")]
-        for dose, color, label in cases:
-            stress, _, _ = monte_carlo_damage_fraction(
-                dose, n_cells=payload["n_cells"], seed=payload["seed"]
-            )
-            solution = solve_adenylate_kinetics(stress, t_eval)
-            atp_t = np.maximum(solution.y[0], 0.0)
-            adp_t = np.maximum(solution.y[1], 0.0)
-            amp_t = np.maximum(solution.y[2], 0.0)
-            aec_t = (atp_t + 0.5 * adp_t) / (atp_t + adp_t + amp_t)
-            ax2.plot(t_eval, aec_t, color=color, lw=2.0, label=label)
-        ax2.axhline(0.70, color="#ef6c00", ls=":", lw=1.2)
-        ax2.axhline(0.50, color="#c62828", ls="-.", lw=1.2)
-        ax2.set(title="B) Zamana Bagli AEC", xlabel="Zaman (saniye)", ylabel="AEC",
-                ylim=(0.25, 1.02))
-        ax2.grid(True, ls="--", alpha=0.4)
-        ax2.legend(loc="lower left", fontsize=8)
-
-        ax3 = self.axes[2]
-        ax3.plot(doses, atp, "-", color="#1565c0", lw=2.0, label="ATP")
-        ax3.plot(doses, adp, "--", color="#f9a825", lw=2.0, label="ADP")
-        ax3.plot(doses, amp, "-.", color="#ad1457", lw=2.0, label="AMP")
-        ax3.set(title="C) Adenilat Dagilimi", xlabel="Doz (Gy)", ylabel="Mol Kesri",
-                ylim=(0.0, 1.0))
-        ax3.grid(True, ls="--", alpha=0.4)
-        ax3.legend(loc="center right", fontsize=8)
-
-        self.figure.tight_layout()
+        plot_simulation_results(
+            self.figure,
+            self.axes,
+            doses,
+            acute,
+            sd,
+            adaptive,
+            adaptive_sd,
+            atp,
+            adp,
+            amp,
+            time_points,
+            time_courses,
+            payload["priming_dose"],
+        )
         self.canvas.draw()
         image_path = payload["output_dir"] / "doz_bagimli_aec_egrileri.png"
         try:
@@ -689,7 +1018,24 @@ class SimulationGui:
                 dpi=300,
                 bbox_inches="tight",
             )
-            output_message = f"Tamamlandi - CSV: {payload['csv'].name}"
+            save_detailed_plots(
+                payload["output_dir"],
+                doses,
+                acute,
+                sd,
+                adaptive,
+                adaptive_sd,
+                atp,
+                adp,
+                amp,
+                time_points,
+                time_courses,
+                payload["priming_dose"],
+            )
+            output_message = (
+                "Çıktılar kaydedildi:\n"
+                f"{payload['output_dir']}"
+            )
         except (OSError, UnicodeError) as exc:
             output_message = f"Grafik kaydedilemedi: {exc}"
         self.progress["value"] = 100
@@ -714,7 +1060,8 @@ def main() -> None:
 
     try:
         doses = validate_cli_args(args)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = args.output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         aec_acute, sd_acute, atp, adp, amp = simulate_dose_response(
             doses,
@@ -731,40 +1078,44 @@ def main() -> None:
             uncertainty_replicates=args.uncertainty_replicates,
         )
 
-        results = pd.DataFrame(
-            {
-                "Doz_Gy": doses,
-                "AEC_Akut": np.round(aec_acute, 4),
-                "AEC_Akut_SD": np.round(sd_acute, 4),
-                f"AEC_Adaptif_D1_{args.priming_dose:g}Gy": np.round(aec_adaptive, 4),
-                f"AEC_Adaptif_D1_{args.priming_dose:g}Gy_SD": np.round(sd_adaptive, 4),
-                "ATP_Mol_Kesri": np.round(atp, 4),
-                "ADP_Mol_Kesri": np.round(adp, 4),
-                "AMP_Mol_Kesri": np.round(amp, 4),
-            }
+        results = build_results_dataframe(
+            doses,
+            aec_acute,
+            sd_acute,
+            aec_adaptive,
+            sd_adaptive,
+            atp,
+            adp,
+            amp,
+            args.priming_dose,
         )
-        csv_path = args.output_dir / "simulasyon_ciktilari.csv"
-        results.to_csv(csv_path, index=False)
+        csv_path, excel_path = save_results(results, output_dir)
 
         create_plots(
             doses=doses,
             aec_acute=aec_acute,
             sd_acute=sd_acute,
             aec_adaptive=aec_adaptive,
+            sd_adaptive=sd_adaptive,
             atp_fraction=atp,
             adp_fraction=adp,
             amp_fraction=amp,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             n_cells=args.n_cells,
             seed=args.seed,
+            priming_dose=args.priming_dose,
         )
 
         print(results.head(10).to_string(index=False))
         print(f"\nCSV kaydedildi: {csv_path}")
-        print(f"Grafik kaydedildi: {args.output_dir / 'doz_bagimli_aec_egrileri.png'}")
+        print(f"Excel kaydedildi: {excel_path}")
+        print(f"Grafik kaydedildi: {output_dir / 'doz_bagimli_aec_egrileri.png'}")
+        print(f"A grafiği kaydedildi: {output_dir / 'aec_doz_yaniti.png'}")
+        print(f"B grafiği kaydedildi: {output_dir / 'aec_zaman_kinetigi.png'}")
+        print(f"C grafiği kaydedildi: {output_dir / 'adenilat_mol_kesirleri.png'}")
 
         if not args.no_show:
-            image = plt.imread(args.output_dir / "doz_bagimli_aec_egrileri.png")
+            image = plt.imread(output_dir / "doz_bagimli_aec_egrileri.png")
             fig = plt.figure(figsize=(12, 7))
             plt.imshow(image)
             plt.axis("off")

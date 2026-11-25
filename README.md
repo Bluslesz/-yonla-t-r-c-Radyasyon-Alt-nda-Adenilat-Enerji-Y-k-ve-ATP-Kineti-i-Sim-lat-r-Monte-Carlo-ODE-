@@ -26,8 +26,9 @@ The application starts a simulation with the default settings. Change the
 settings on the right and select **Simulasyonu Calistir** to run another one.
 The results table and three plots update when the run completes.
 
-By default, the CSV and PNG outputs are saved to the current working directory.
-Use `--output-dir` to choose another folder.
+By default, the CSV, Excel, and PNG outputs are saved in the `ciktilar` folder
+next to the Python script. The application displays the full output path when
+the run completes. Use `--output-dir` to choose another folder.
 
 ## Command-line options
 
@@ -44,7 +45,12 @@ For a non-interactive run, add `--headless --no-show`.
 
 - `simulasyon_ciktilari.csv` — dose response, AEC uncertainty, and adenylate
   fractions.
-- `doz_bagimli_aec_egrileri.png` — publication-resolution plots.
+- `simulasyon_ciktilari.xlsx` — the same results in separate, formatted
+  spreadsheet columns.
+- `doz_bagimli_aec_egrileri.png` — combined overview of the three plots.
+- `aec_doz_yaniti.png` — detailed dose-response plot (A).
+- `aec_zaman_kinetigi.png` — detailed time-course plot (B).
+- `adenilat_mol_kesirleri.png` — detailed ATP, ADP, and AMP fraction plot (C).
 
 ## Model note
 
